@@ -1,0 +1,65 @@
+# lichess-bot configuration for Antichess AlphaZero
+# 
+# Setup steps:
+#   1. pip install lichess-bot
+#   2. Create a Lichess account and generate an API token at:
+#      https://lichess.org/account/oauth/token/create
+#      (select "Play games with the bot API" scope)
+#   3. Upgrade to bot account (IRREVERSIBLE):
+#      python -m lichess_bot.upgrade_account --token YOUR_TOKEN
+#   4. Place this file as config.yml in the lichess-bot directory
+#   5. Run: python -m lichess_bot --config config.yml
+
+token: "YOUR_LICHESS_API_TOKEN_HERE"
+
+engine:
+  # Path to the UCI engine script
+  dir: "/path/to/antichess_alphazero/"
+  name: "python"
+  # Pass uci.py and model path as arguments
+  engine_argument: "uci.py --model checkpoints/best.pt --simulations 800"
+  
+  protocol: "uci"
+  
+  uci_options:
+    # You can override options here
+    Simulations: 800
+    # UCI_Variant will be set automatically by lichess-bot
+  
+  # Time management: let the engine handle it via wtime/btime
+  # Or set a fixed move time (in seconds)
+  # move_overhead: 500  # ms overhead for network latency
+
+# What challenges to accept
+challenge:
+  # Accepted variants
+  variants:
+    - antichess
+    - giveaway  # some clients call it giveaway
+
+  # Time controls to accept
+  time_controls:
+    - bullet
+    - blitz
+    - rapid
+    - classical
+    - correspondence
+
+  # Accept challenges from:
+  modes:
+    - casual
+    - rated
+
+  # Accept bot challenges
+  accept_bot: true
+  
+  # Min/max rating of opponents (optional)
+  # min_rating: 0
+  # max_rating: 3000
+
+# How many games to play simultaneously
+max_concurrent: 1
+
+# Logging
+logging:
+  level: "INFO"
