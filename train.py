@@ -286,22 +286,43 @@ class Trainer:
         else:
             self.ddp_model = self.model
 
-        # Persistent optimizer
+        # Persistent optimizer — start at near-zero LR, warm-up will ramp it
         self.optimizer = optim.Adam(
             self.ddp_model.parameters(),
             lr=config['learning_rate'],
             weight_decay=config['weight_decay'],
         )
 
-        # LR scheduler: cosine annealing with warm restarts
-        # T_0 = epochs per restart cycle, decays LR from lr_max to lr_min
-        # Restarts every `lr_restart_interval` training iterations
-        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer,
-            T_0=config.get('lr_restart_interval', 10) * config['epochs'],
-            T_mult=1,
-            eta_min=config['learning_rate'] * 0.01,
-        )
+        # LR schedule: linear warm-up → cosine decay
+        #
+        # Problem without warm-up:
+        #   Iteration 1: weights are random, gradients are huge & noisy.
+        #   Full LR=2e-3 causes large, erratic parameter updates.
+        #   Adam's m_t and v_t are initialized to 0, so early estimates
+        #   are biased and unreliable → training can diverge or oscillate.
+        #
+        # Solution: ramp LR from ~0 to target over `warmup_steps` steps,
+        # then cosine decay to eta_min for stable late-stage training.
+        warmup_steps = config.get('warmup_steps', 1000)
+        self._warmup_steps = warmup_steps
+
+        # Cosine phase scheduler (activated after warm-up)
+        # We use a LambdaLR that handles both phases in one function
+        lr_min_ratio = 0.01  # eta_min / lr_max
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                # Linear warm-up: 0 → 1
+                return step / max(warmup_steps, 1)
+            else:
+                # Cosine annealing with warm restarts
+                import math
+                T_0 = config.get('lr_restart_interval', 10) * config['epochs']
+                progress = (step - warmup_steps) % T_0
+                return lr_min_ratio + (1 - lr_min_ratio) * 0.5 * (
+                    1 + math.cos(math.pi * progress / T_0))
+
+        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
         self.replay_buffer = deque(maxlen=config['replay_buffer_size'])
         self.iteration = 0
@@ -514,25 +535,26 @@ DEFAULT_CONFIG = {
     'num_simulations': 800,
     'arena_simulations': 400,
 
-    'self_play_games': 100,
+    'self_play_games': 25,         # fewer games, more iterations → faster flywheel
     'temp_threshold': 30,
     'random_opening_moves': 2,     # random first N moves for diversity
 
     'learning_rate': 2e-3,
     'weight_decay': 1e-4,
     'batch_size': 256,
-    'epochs': 10,
-    'replay_buffer_size': 500_000,
-    'min_buffer_size': 4096,
-    'lr_restart_interval': 10,     # cosine annealing restart every N iterations
+    'epochs': 5,                   # halved: less overfitting on small batches
+    'replay_buffer_size': 200_000, # smaller: old data from weak model expires faster
+    'min_buffer_size': 2048,
+    'lr_restart_interval': 40,     # cosine restart every 40 iters (was 10 × fewer iters)
+    'warmup_steps': 500,           # fewer total steps early on
 
-    'arena_games': 40,
+    'arena_games': 20,             # halved: faster eval, still statistically meaningful
     'win_threshold': 0.55,
 
-    'resign_threshold': -0.95,     # resign if value below this
-    'resign_consecutive': 5,       # for this many consecutive moves
+    'resign_threshold': -0.95,
+    'resign_consecutive': 5,
 
-    'save_interval': 5,
+    'save_interval': 10,
     'log_path': 'logs/train_log.csv',
 }
 
@@ -544,17 +566,18 @@ SMALL_CONFIG = {
     'num_simulations': 100,
     'arena_simulations': 50,
 
-    'self_play_games': 10,
+    'self_play_games': 5,          # very fast iteration for testing
     'temp_threshold': 15,
     'random_opening_moves': 2,
 
     'learning_rate': 2e-3,
     'weight_decay': 1e-4,
     'batch_size': 64,
-    'epochs': 5,
-    'replay_buffer_size': 50_000,
-    'min_buffer_size': 512,
-    'lr_restart_interval': 5,
+    'epochs': 3,
+    'replay_buffer_size': 20_000,
+    'min_buffer_size': 256,
+    'lr_restart_interval': 20,
+    'warmup_steps': 100,
 
     'arena_games': 10,
     'win_threshold': 0.55,
@@ -562,14 +585,15 @@ SMALL_CONFIG = {
     'resign_threshold': -0.95,
     'resign_consecutive': 5,
 
-    'save_interval': 2,
+    'save_interval': 5,
     'log_path': 'logs/train_log_small.csv',
 }
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train AlphaZero for Antichess')
-    parser.add_argument('--iterations', type=int, default=100)
+    parser.add_argument('--iterations', type=int, default=400,
+                        help='Number of training iterations (default 400, was 100 with old config)')
     parser.add_argument('--small', action='store_true')
     parser.add_argument('--resume', type=str, default=None)
     args = parser.parse_args()
