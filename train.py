@@ -232,29 +232,39 @@ def arena_evaluate(new_model: nn.Module, old_state_dict: dict,
 # ─── Checkpointing ───
 
 def save_checkpoint(model: nn.Module, iteration: int, config: dict,
-                    train_losses: list, path: str = None):
-    """Save model checkpoint (rank 0 only)."""
+                    train_losses: list, optimizer=None, scheduler=None,
+                    path: str = None):
+    """Save model + optimizer + scheduler checkpoint (rank 0 only)."""
     os.makedirs('checkpoints', exist_ok=True)
     path = path or f'checkpoints/antichess_az_iter{iteration:04d}.pt'
-    # If model is DDP-wrapped, save the inner module
     state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-    torch.save({
+    data = {
         'iteration': iteration,
         'model_state_dict': state_dict,
         'train_losses': train_losses,
         'config': config,
-    }, path)
+    }
+    if optimizer is not None:
+        data['optimizer_state_dict'] = optimizer.state_dict()
+    if scheduler is not None:
+        data['scheduler_state_dict'] = scheduler.state_dict()
+    torch.save(data, path)
     print(f"Checkpoint saved: {path}", flush=True)
 
 
-def load_checkpoint(model: nn.Module, path: str, device: torch.device) -> Tuple[int, list]:
-    """Load checkpoint into model."""
+def load_checkpoint(model: nn.Module, path: str, device: torch.device,
+                    optimizer=None, scheduler=None) -> Tuple[int, list]:
+    """Load model + optimizer + scheduler from checkpoint."""
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     state_dict = checkpoint['model_state_dict']
     if hasattr(model, 'module'):
         model.module.load_state_dict(state_dict)
     else:
         model.load_state_dict(state_dict)
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     return checkpoint['iteration'], checkpoint.get('train_losses', [])
 
 
@@ -422,7 +432,8 @@ class Trainer:
     def run(self, num_iterations: int, resume_path: str = None):
         if resume_path and os.path.exists(resume_path):
             self.iteration, self.train_losses = load_checkpoint(
-                self.model, resume_path, self.device)
+                self.model, resume_path, self.device,
+                optimizer=self.optimizer, scheduler=self.scheduler)
             print_rank0(f"Resumed from {resume_path} (iter {self.iteration})", self.rank)
 
         broadcast_model(self.model)
@@ -508,7 +519,9 @@ class Trainer:
 
                 if self.iteration % self.config['save_interval'] == 0:
                     save_checkpoint(self.model, self.iteration,
-                                    self.config, self.train_losses)
+                                    self.config, self.train_losses,
+                                    optimizer=self.optimizer,
+                                    scheduler=self.scheduler)
 
                 # Log metrics
                 self.logger.log(metrics)
