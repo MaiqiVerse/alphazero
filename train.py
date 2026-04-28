@@ -43,7 +43,7 @@ from torch.utils.data.distributed import DistributedSampler
 from game import AntichessGame, ACTION_SIZE
 from model import AntichessNet
 from mcts import MCTS
-from self_play import SelfPlayWorker, GameStats
+from self_play import ParallelSelfPlayWorker, GameStats
 from logger import TrainLogger, IterationMetrics
 
 
@@ -141,24 +141,19 @@ def parallel_self_play(model: nn.Module, config: dict,
     )
 
     model.eval()
-    worker = SelfPlayWorker(
+    worker = ParallelSelfPlayWorker(
         model,
         num_simulations=config['num_simulations'],
+        num_parallel=min(8, games_per_rank),
+        leaves_per_game=config.get('leaves_per_game', 8),
         temp_threshold=config['temp_threshold'],
         random_opening_moves=config.get('random_opening_moves', 0),
         resign_threshold=config.get('resign_threshold', -0.95),
         resign_consecutive=config.get('resign_consecutive', 5),
     )
 
-    local_examples = []
-    local_stats = []
-    for i in range(games_per_rank):
-        examples, stats = worker.play_game()
-        local_examples.extend(examples)
-        local_stats.append(stats)
-        if (i + 1) % 10 == 0 or (i + 1) == games_per_rank:
-            print(f"  [GPU {rank}] {i+1}/{games_per_rank} games, "
-                  f"{len(local_examples)} examples", flush=True)
+    # Play all games in parallel (NOT a sequential loop anymore)
+    local_examples, local_stats = worker.play_games(total_games=games_per_rank)
 
     # Gather all examples and stats to rank 0
     all_examples = gather_examples(local_examples, rank, world_size)
@@ -176,7 +171,7 @@ def arena_evaluate(new_model: nn.Module, old_state_dict: dict,
                    config: dict, device: torch.device) -> float:
     """
     Evaluate new model vs old model. Runs on rank 0 only.
-    Returns win rate of new model.
+    Early termination: stop if result is already clear.
     """
     new_model.eval()
 
@@ -193,6 +188,7 @@ def arena_evaluate(new_model: nn.Module, old_state_dict: dict,
 
     new_wins = 0
     num_games = config['arena_games']
+    threshold = config['win_threshold']
 
     for i in range(num_games):
         if i % 2 == 0:
@@ -203,7 +199,8 @@ def arena_evaluate(new_model: nn.Module, old_state_dict: dict,
             new_color = 1
 
         game = AntichessGame()
-        while True:
+        move_count = 0
+        while move_count < 200:
             over, winner = game.is_game_over()
             if over:
                 break
@@ -219,12 +216,33 @@ def arena_evaluate(new_model: nn.Module, old_state_dict: dict,
             if move is None:
                 move = legal[0]
             game.apply_move(move)
+            move_count += 1
 
         if winner == new_color:
             new_wins += 1
 
-        if (i + 1) % 10 == 0:
-            print(f"  Arena: {i+1}/{num_games}, new wins: {new_wins}", flush=True)
+        played = i + 1
+        remaining = num_games - played
+
+        # Early termination: stop if result is already decided
+        # Can't possibly reach threshold even if winning all remaining
+        best_possible = (new_wins + remaining) / num_games
+        if best_possible < threshold:
+            print(f"  Arena: {played}/{num_games}, wins={new_wins} — "
+                  f"early stop (best possible {best_possible:.0%} < {threshold:.0%})",
+                  flush=True)
+            return new_wins / played
+
+        # Already clearly above threshold with big margin
+        worst_possible = new_wins / num_games
+        if played >= 10 and worst_possible >= threshold:
+            print(f"  Arena: {played}/{num_games}, wins={new_wins} — "
+                  f"early accept (already {worst_possible:.0%} >= {threshold:.0%})",
+                  flush=True)
+            return new_wins / played
+
+        if played % 5 == 0:
+            print(f"  Arena: {played}/{num_games}, wins={new_wins}", flush=True)
 
     return new_wins / num_games
 
@@ -556,7 +574,7 @@ DEFAULT_CONFIG = {
     'channels': 128,
 
     'num_simulations': 800,
-    'arena_simulations': 400,
+    'arena_simulations': 100,
 
     'self_play_games': 25,         # fallback if min/max not set
     'self_play_games_min': 5,      # start with 5 games/iter (fast early iteration)
@@ -570,7 +588,7 @@ DEFAULT_CONFIG = {
     'batch_size': 256,
     'epochs': 5,                   # halved: less overfitting on small batches
     'replay_buffer_size': 200_000, # smaller: old data from weak model expires faster
-    'min_buffer_size': 512,
+    'min_buffer_size': 2048,
     'lr_restart_interval': 40,     # cosine restart every 40 iters (was 10 × fewer iters)
     'warmup_steps': 500,           # fewer total steps early on
 
