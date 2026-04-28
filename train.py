@@ -130,7 +130,7 @@ def parallel_self_play(model: nn.Module, config: dict,
     Run self-play games distributed across all GPUs.
     Returns (examples, stats_list).
     """
-    total_games = config['self_play_games']
+    total_games = config.get('_current_self_play_games', config['self_play_games'])
     games_per_rank = total_games // world_size
     if rank < total_games % world_size:
         games_per_rank += 1
@@ -442,8 +442,18 @@ class Trainer:
             self.iteration += 1
             metrics = IterationMetrics(iteration=self.iteration)
 
+            # Dynamic self-play game count: ramp from min→max over training
+            # Early: few games, fast iteration, model improves quickly
+            # Late: more games, higher-quality data, more diversity
+            sp_min = self.config.get('self_play_games_min', self.config['self_play_games'])
+            sp_max = self.config.get('self_play_games_max', self.config['self_play_games'])
+            ramp_iters = self.config.get('self_play_ramp_iters', num_iterations)
+            progress = min(self.iteration / max(ramp_iters, 1), 1.0)
+            current_games = int(sp_min + (sp_max - sp_min) * progress)
+            self.config['_current_self_play_games'] = current_games
+
             print_rank0(f"\n{'='*60}", self.rank)
-            print_rank0(f"  ITERATION {self.iteration}", self.rank)
+            print_rank0(f"  ITERATION {self.iteration}  (self-play: {current_games} games)", self.rank)
             print_rank0(f"{'='*60}", self.rank)
 
             # ── Phase 1: Self-Play ──
@@ -548,7 +558,10 @@ DEFAULT_CONFIG = {
     'num_simulations': 800,
     'arena_simulations': 400,
 
-    'self_play_games': 25,         # fewer games, more iterations → faster flywheel
+    'self_play_games': 25,         # fallback if min/max not set
+    'self_play_games_min': 5,      # start with 5 games/iter (fast early iteration)
+    'self_play_games_max': 50,     # ramp up to 50 games/iter (quality late data)
+    'self_play_ramp_iters': 200,   # reach max at iteration 200
     'temp_threshold': 30,
     'random_opening_moves': 2,     # random first N moves for diversity
 
@@ -579,7 +592,10 @@ SMALL_CONFIG = {
     'num_simulations': 100,
     'arena_simulations': 50,
 
-    'self_play_games': 5,          # very fast iteration for testing
+    'self_play_games': 5,          # fallback
+    'self_play_games_min': 3,      # start small
+    'self_play_games_max': 10,     # ramp to 10
+    'self_play_ramp_iters': 30,    # reach max at iter 30
     'temp_threshold': 15,
     'random_opening_moves': 2,
 
