@@ -588,7 +588,7 @@ DEFAULT_CONFIG = {
     'batch_size': 256,
     'epochs': 5,                   # halved: less overfitting on small batches
     'replay_buffer_size': 200_000, # smaller: old data from weak model expires faster
-    'min_buffer_size': 2048,
+    'min_buffer_size': 512,
     'lr_restart_interval': 40,     # cosine restart every 40 iters (was 10 × fewer iters)
     'warmup_steps': 500,           # fewer total steps early on
 
