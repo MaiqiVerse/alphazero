@@ -13,6 +13,11 @@ via the UCI_Variant option.
 
 import sys
 import os
+
+# Force line-buffered stdout so UCI responses are sent immediately.
+# reconfigure() is safe — it doesn't close/reopen the underlying fd.
+sys.stdout.reconfigure(line_buffering=True)
+
 import argparse
 import threading
 import time
@@ -48,6 +53,7 @@ def fen_to_game(fen: str) -> AntichessGame:
     game.board = np.zeros(64, dtype=np.int8)
     game.history = []
     game.move_count = 0
+    game.en_passant_sq = -1
 
     row, col = 0, 0
     for ch in board_str:
@@ -61,6 +67,13 @@ def fen_to_game(fen: str) -> AntichessGame:
             col += 1
 
     game.turn = WHITE if turn_str == 'w' else BLACK
+
+    # Parse en passant square from FEN (e.g. "e3" or "-")
+    if len(parts) > 3 and parts[3] != '-':
+        ep_str = parts[3]
+        ep_col = 'abcdefgh'.index(ep_str[0])
+        ep_row = 8 - int(ep_str[1])
+        game.en_passant_sq = ep_row * 8 + ep_col
 
     if len(parts) > 5:
         game.move_count = int(parts[5]) * 2 + (1 if game.turn == BLACK else 0)
@@ -152,10 +165,6 @@ class UCIEngine:
         self.simulations = simulations
         self.model_path = model_path
 
-        # Will be loaded on 'isready'
-        self.model = None
-        self.mcts = None
-
         # Game state
         self.game = AntichessGame()
 
@@ -163,8 +172,24 @@ class UCIEngine:
         self.searching = False
         self.stop_flag = False
 
+        # Start loading model in background thread so UCI handshake
+        # can complete immediately (lichess-bot has a 60s timeout).
+        self.model = None
+        self.mcts = None
+        self._model_ready = threading.Event()
+        self._load_thread = threading.Thread(target=self._load_model, daemon=True)
+        self._load_thread.start()
+
+    def _wait_for_model(self):
+        """Block until model is loaded. Called before any search."""
+        if not self._model_ready.is_set():
+            print("Waiting for model...", file=sys.stderr, flush=True)
+            self._model_ready.wait()
+
+
     def _load_model(self):
-        """Load neural network model."""
+        """Load neural network model. Runs in background thread.
+        MUST NOT write to stdout — that would corrupt the UCI protocol."""
         self.model = AntichessNet(
             in_channels=18,
             num_res_blocks=10,
@@ -174,7 +199,6 @@ class UCIEngine:
         if self.model_path and os.path.exists(self.model_path):
             checkpoint = torch.load(self.model_path, map_location=self.device,
                                     weights_only=False)
-            # Handle both full checkpoint and raw state dict
             if 'model_state_dict' in checkpoint:
                 config = checkpoint.get('config', {})
                 self.model = AntichessNet(
@@ -185,13 +209,14 @@ class UCIEngine:
                 self.model.load_state_dict(checkpoint['model_state_dict'])
             else:
                 self.model.load_state_dict(checkpoint)
-
-            log(f"info string Loaded model from {self.model_path}")
+            # stderr only — stdout is reserved for UCI protocol
+            print(f"Model loaded: {self.model_path}", file=sys.stderr, flush=True)
         else:
-            log("info string WARNING: No model loaded, using random weights")
+            print("WARNING: No model, using random weights", file=sys.stderr, flush=True)
 
         self.model.eval()
         self.mcts = MCTS(self.model, num_simulations=self.simulations)
+        self._model_ready.set()
 
     def handle_uci(self):
         """Respond to 'uci' command."""
@@ -229,9 +254,8 @@ class UCIEngine:
             log(f"info string Variant set to {value}")
 
     def handle_isready(self):
-        """Handle 'isready' command. Load model if needed."""
-        if self.model is None:
-            self._load_model()
+        """Handle 'isready' command. Wait for model if still loading."""
+        self._wait_for_model()
         send("readyok")
 
     def handle_ucinewgame(self):
@@ -335,6 +359,7 @@ class UCIEngine:
 
         def search_thread():
             try:
+                self._wait_for_model()
                 self.mcts.num_simulations = sims
                 log(f"info string Searching with {sims} simulations...")
 
