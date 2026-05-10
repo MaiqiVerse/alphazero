@@ -110,27 +110,50 @@ def apply_player_move(from_sq: int, to_sq: int, promo: int = 0) -> dict:
 
     # AI responds
     if game_state.turn != player_color:
-        ai_move = ai_think()
+        ai_move, move_infos = ai_think()
         if ai_move:
             result['aiMove'] = {'from': ai_move.from_sq, 'to': ai_move.to_sq}
             result = get_board_json(game_state)
             result['aiMove'] = {'from': ai_move.from_sq, 'to': ai_move.to_sq}
+            result['aiAnalysis'] = move_infos
 
     return result
 
 
 def ai_think():
-    """Run MCTS and apply AI move."""
+    """Run MCTS and apply AI move. Returns (move, top_moves_info)."""
     global game_state
 
     over, _ = game_state.is_game_over()
     if over:
-        return None
+        return None, []
 
     pi = engine_mcts.search(game_state, temperature=0.1, add_noise=False)
     action = np.argmax(pi)
 
+    # Collect top moves with visit counts for display
     legal = game_state.legal_moves()
+    move_infos = []
+    total_visits = pi.sum()
+    for m in legal:
+        a = m.to_action_index()
+        visits = pi[a]
+        if visits > 0:
+            cols = 'abcdefgh'
+            move_str = f"{cols[m.from_sq%8]}{8-m.from_sq//8}{cols[m.to_sq%8]}{8-m.to_sq//8}"
+            if m.promo:
+                move_str += '=' + 'xPNBRQK'[PIECE_TYPE[m.promo]]
+            pct = visits / total_visits * 100 if total_visits > 0 else 0
+            move_infos.append({'move': move_str, 'visits': float(visits), 'pct': round(pct, 1)})
+    move_infos.sort(key=lambda x: -x['visits'])
+    move_infos = move_infos[:8]  # top 8
+
+    # Get value estimate
+    state = game_state.encode()
+    _, value = engine_mcts.model.predict(state)
+    for info in move_infos:
+        info['value'] = round(float(value), 3)
+
     move = None
     for m in legal:
         if m.to_action_index() == action:
@@ -142,13 +165,13 @@ def ai_think():
     if move:
         game_state.apply_move(move)
 
-    return move
+    return move, move_infos
 
 
 # ─── HTML UI ───
 
 HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -253,7 +276,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .sq.light .coord { color: #b58863; }
   .sq.dark .coord { color: #f0d9b5; }
 
-  .piece { z-index: 1; line-height: 1; transition: transform 0.12s; }
+  .piece { z-index: 1; line-height: 1; transition: transform 0.12s;
+    text-shadow: -1px 0 1px rgba(0,0,0,0.6), 1px 0 1px rgba(0,0,0,0.6),
+                 0 -1px 1px rgba(0,0,0,0.6), 0 1px 1px rgba(0,0,0,0.6); }
   .sq.selected .piece { transform: scale(1.15); filter: drop-shadow(0 0 8px rgba(201,168,76,0.8)); }
 
   .captured {
@@ -294,16 +319,46 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-size: 12px; color: #8b7d6b; font-family: monospace;
     display: flex; flex-wrap: wrap; gap: 2px 8px;
   }
+
+  .analysis {
+    margin-top: 10px; max-width: 480px; width: 100%;
+    padding: 8px 12px; background: #252220; border-radius: 6px;
+    font-size: 12px; font-family: monospace;
+  }
+
+  .analysis-title {
+    font-size: 11px; color: #c9a84c; margin-bottom: 6px; font-weight: 700;
+    letter-spacing: 1px;
+  }
+
+  .analysis-row {
+    display: flex; align-items: center; gap: 8px; margin: 3px 0;
+    color: #e8dcc8;
+  }
+
+  .analysis-row.best { color: #c9a84c; font-weight: 700; }
+
+  .analysis-move { width: 50px; }
+  .analysis-bar-bg {
+    flex: 1; height: 14px; background: #1a1714; border-radius: 3px;
+    overflow: hidden;
+  }
+  .analysis-bar {
+    height: 100%; border-radius: 3px;
+    transition: width 0.3s;
+  }
+  .analysis-pct { width: 45px; text-align: right; font-size: 11px; color: #8b7d6b; }
+  .analysis-value { width: 50px; text-align: right; font-size: 11px; color: #8b7d6b; }
 </style>
 </head>
 <body>
   <h1>♚ ANTICHESS ALPHAZERO</h1>
-  <p class="subtitle">有子必吃 · 失去所有棋子者获胜</p>
+  <p class="subtitle">Must capture · Lose all pieces to win</p>
 
   <div class="controls">
-    <button onclick="newGame(0)">执白</button>
-    <button onclick="newGame(1)">执黑</button>
-    <button onclick="undoMove()">悔棋</button>
+    <button onclick="newGame(0)">Play White</button>
+    <button onclick="newGame(1)">Play Black</button>
+    <button onclick="undoMove()">Undo</button>
   </div>
 
   <div class="captured" id="captured-top"></div>
@@ -316,7 +371,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <div class="captured" id="captured-bottom"></div>
-  <div class="status" id="status">加载中...</div>
+  <div class="status" id="status">Loading...</div>
+  <div class="analysis" id="analysis" style="display:none">
+    <div class="analysis-title">🔍 AI Move Analysis</div>
+    <div id="analysis-rows"></div>
+  </div>
+  <div class="analysis" id="hint-panel" style="display:none">
+    <div class="analysis-title" style="color:#7aac7a">🎯 AI Predicts Your Move</div>
+    <div id="hint-rows"></div>
+  </div>
   <div class="move-log" id="move-log"></div>
 
 <script>
@@ -327,6 +390,8 @@ let lastMove = null;
 let flipped = false;
 let moveLog = [];
 let capturedW = [], capturedB = [];
+let lastAnalysis = null;
+let lastHint = null;
 const SYM = {1:'♙',2:'♘',3:'♗',4:'♖',5:'♕',6:'♔',7:'♟',8:'♞',9:'♝',10:'♜',11:'♛',12:'♚'};
 const COLS = 'abcdefgh';
 
@@ -337,7 +402,7 @@ async function api(endpoint, params={}) {
 }
 
 async function newGame(color) {
-  capturedW = []; capturedB = []; moveLog = [];
+  capturedW = []; capturedB = []; moveLog = []; lastAnalysis = null; lastHint = null;
   flipped = color === 1;
   state = await api('/api/new', {color});
   selected = null; lastMove = null;
@@ -348,8 +413,18 @@ async function newGame(color) {
     setStatus('thinking');
     state = await api('/api/ai_move');
     if (state.aiMove) lastMove = state.aiMove;
+    if (state.aiAnalysis) lastAnalysis = state.aiAnalysis;
     render();
+    // Fetch AI's prediction of player's moves
+    fetchHint();
   }
+}
+
+async function fetchHint() {
+  if (!state || state.gameOver || state.turn !== state.playerColor) return;
+  const h = await api('/api/hint');
+  lastHint = h.hint || [];
+  renderHint();
 }
 
 async function undoMove() {
@@ -363,7 +438,7 @@ function setStatus(type, text) {
   el.className = 'status';
   if (type === 'thinking') {
     el.classList.add('thinking');
-    el.textContent = '🤔 AI 思考中...';
+    el.textContent = '🤔 AI thinking...';
   } else if (type === 'gameover') {
     el.classList.add('gameover');
     el.textContent = text;
@@ -441,47 +516,50 @@ async function makeMove(from, to, promo) {
 
   setStatus('thinking');
   selected = null; validTargets = [];
+  lastHint = null; // clear old prediction
 
   state = await api('/api/move', {from, to, promo});
 
   if (state.error) {
-    setStatus('', '非法走法');
+    setStatus('', 'Illegal move');
     return;
   }
 
   lastMove = {from, to};
 
   if (state.aiMove) {
-    // Record AI capture
-    const aiCaptured = state.board[state.aiMove.to]; // already applied
-    // We rely on server state; just record move text
     const af = COLS[state.aiMove.from%8] + (8-Math.floor(state.aiMove.from/8));
     const at = COLS[state.aiMove.to%8] + (8-Math.floor(state.aiMove.to/8));
     moveLog.push(af+'-'+at);
     lastMove = state.aiMove;
   }
+  if (state.aiAnalysis) lastAnalysis = state.aiAnalysis;
 
   render();
+  // Fetch AI's prediction of player's next moves
+  fetchHint();
 }
 
 function render() {
   renderBoard();
   renderCaptured();
   renderMoveLog();
+  renderAnalysis();
+  renderHint();
 
   if (!state) {
-    setStatus('', '点击「执白」或「执黑」开始');
+    setStatus('', 'Click "Play White" or "Play Black" to start');
     return;
   }
 
   if (state.gameOver) {
     const w = state.winner;
-    if (w === null || w === -1) setStatus('gameover', '和棋！');
-    else if (w === state.playerColor) setStatus('gameover', '🎉 你赢了！');
-    else setStatus('gameover', '💀 AI 赢了！');
+    if (w === null || w === -1) setStatus('gameover', 'Draw!');
+    else if (w === state.playerColor) setStatus('gameover', '🎉 You win!');
+    else setStatus('gameover', '💀 AI wins!');
   } else {
-    const who = state.turn === state.playerColor ? '你' : 'AI';
-    setStatus('', (state.turn === 0 ? '白方' : '黑方') + '走棋 (' + who + ')');
+    const who = state.turn === state.playerColor ? 'You' : 'AI';
+    setStatus('', (state.turn === 0 ? 'White' : 'Black') + ' to move (' + who + ')');
   }
 }
 
@@ -532,8 +610,8 @@ function renderCaptured() {
   const top = document.getElementById('captured-top');
   const bottom = document.getElementById('captured-bottom');
 
-  const wHtml = '<span class="label">白方被吃:</span>' + capturedW.map(p=>'<span>'+SYM[p]+'</span>').join('');
-  const bHtml = '<span class="label">黑方被吃:</span>' + capturedB.map(p=>'<span>'+SYM[p]+'</span>').join('');
+  const wHtml = '<span class="label">White captured:</span>' + capturedW.map(p=>'<span>'+SYM[p]+'</span>').join('');
+  const bHtml = '<span class="label">Black captured:</span>' + capturedB.map(p=>'<span>'+SYM[p]+'</span>').join('');
 
   top.innerHTML = flipped ? wHtml : bHtml;
   bottom.innerHTML = flipped ? bHtml : wHtml;
@@ -544,8 +622,75 @@ function renderMoveLog() {
   el.innerHTML = moveLog.map((m,i) =>
     '<span>' + (i%2===0 ? Math.floor(i/2)+1+'. ' : '') + m + '</span>'
   ).join('');
-  if (moveLog.length === 0) el.innerHTML = '<span style="opacity:0.4">等待开局...</span>';
+  if (moveLog.length === 0) el.innerHTML = '<span style="opacity:0.4">Waiting for game...</span>';
   el.scrollTop = el.scrollHeight;
+}
+
+function renderAnalysis() {
+  const panel = document.getElementById('analysis');
+  const rows = document.getElementById('analysis-rows');
+
+  if (!lastAnalysis || lastAnalysis.length === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+
+  panel.style.display = 'block';
+  rows.innerHTML = '';
+
+  const maxPct = lastAnalysis[0].pct || 1;
+  const colors = ['#c9a84c','#8b7d6b','#6b6558','#5a5549','#4a4540','#3a3835','#2f2d2a','#252220'];
+
+  lastAnalysis.forEach((info, i) => {
+    const row = document.createElement('div');
+    row.className = 'analysis-row' + (i === 0 ? ' best' : '');
+
+    const barColor = colors[Math.min(i, colors.length-1)];
+    const barWidth = Math.max(2, (info.pct / maxPct) * 100);
+
+    row.innerHTML =
+      '<span class="analysis-move">' + (i===0?'★ ':'  ') + info.move + '</span>' +
+      '<div class="analysis-bar-bg"><div class="analysis-bar" style="width:' +
+      barWidth + '%;background:' + barColor + '"></div></div>' +
+      '<span class="analysis-pct">' + info.pct + '%</span>' +
+      '<span class="analysis-value">v=' + info.value + '</span>';
+
+    rows.appendChild(row);
+  });
+}
+
+function renderHint() {
+  const panel = document.getElementById('hint-panel');
+  const rows = document.getElementById('hint-rows');
+
+  if (!lastHint || lastHint.length === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+
+  panel.style.display = 'block';
+  rows.innerHTML = '';
+
+  const maxPct = lastHint[0].pct || 1;
+  const colors = ['#7aac7a','#6b9b6b','#5c8a5c','#4d794d','#3e683e','#305730','#254625','#1a351a'];
+
+  lastHint.forEach((info, i) => {
+    const row = document.createElement('div');
+    row.className = 'analysis-row' + (i === 0 ? ' best' : '');
+    if (i === 0) row.style.color = '#7aac7a';
+
+    const barColor = colors[Math.min(i, colors.length-1)];
+    const barWidth = Math.max(2, (info.pct / maxPct) * 100);
+
+    row.innerHTML =
+      '<span class="analysis-move">' + (i===0?'★ ':'  ') + info.move + '</span>' +
+      '<div class="analysis-bar-bg"><div class="analysis-bar" style="width:' +
+      barWidth + '%;background:' + barColor + '"></div></div>' +
+      '<span class="analysis-pct">' + info.pct + '%</span>' +
+      '<span class="analysis-value">v=' + info.value + '</span>';
+
+    rows.appendChild(row);
+  });
 }
 
 // Init
@@ -579,13 +724,15 @@ class GameHandler(SimpleHTTPRequestHandler):
             self._handle_move(params)
         elif path == '/api/ai_move':
             self._handle_ai_move()
+        elif path == '/api/hint':
+            self._handle_hint()
         elif path == '/api/undo':
             self._handle_undo()
         else:
             self.send_error(404)
 
     def _send_json(self, data: dict):
-        body = json.dumps(data).encode()
+        body = json.dumps(data, default=lambda o: float(o) if hasattr(o, 'item') else o).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', len(body))
@@ -621,11 +768,48 @@ class GameHandler(SimpleHTTPRequestHandler):
 
     def _handle_ai_move(self):
         global game_state
-        move = ai_think()
+        move, move_infos = ai_think()
         result = get_board_json(game_state)
         if move:
             result['aiMove'] = {'from': move.from_sq, 'to': move.to_sq}
+        result['aiAnalysis'] = move_infos
         self._send_json(result)
+
+    def _handle_hint(self):
+        """Run MCTS on current position to predict player's best moves."""
+        global game_state
+        if game_state is None:
+            self._send_json({'hint': []})
+            return
+        over, _ = game_state.is_game_over()
+        if over:
+            self._send_json({'hint': []})
+            return
+
+        pi = engine_mcts.search(game_state, temperature=1.0, add_noise=False)
+        legal = game_state.legal_moves()
+        total = pi.sum()
+        hints = []
+        for m in legal:
+            a = m.to_action_index()
+            visits = pi[a]
+            if visits > 0:
+                cols = 'abcdefgh'
+                ms = f"{cols[m.from_sq%8]}{8-m.from_sq//8}{cols[m.to_sq%8]}{8-m.to_sq//8}"
+                if m.promo:
+                    ms += '=' + 'xPNBRQK'[PIECE_TYPE[m.promo]]
+                pct = visits / total * 100 if total > 0 else 0
+                hints.append({'move': ms, 'visits': float(visits), 'pct': round(pct, 1),
+                              'from': int(m.from_sq), 'to': int(m.to_sq)})
+        hints.sort(key=lambda x: -x['visits'])
+        hints = hints[:8]
+
+        state = game_state.encode()
+        _, value = engine_mcts.model.predict(state)
+        for h in hints:
+            h['value'] = round(float(value), 3)
+
+        self._send_json({'hint': hints})
 
     def _handle_undo(self):
         global game_state
@@ -645,7 +829,7 @@ def main():
                         help='Path to model checkpoint')
     parser.add_argument('--simulations', type=int, default=800,
                         help='MCTS simulations per move')
-    parser.add_argument('--port', type=int, default=8080,
+    parser.add_argument('--port', type=int, default=8087,
                         help='HTTP server port')
     args = parser.parse_args()
 
